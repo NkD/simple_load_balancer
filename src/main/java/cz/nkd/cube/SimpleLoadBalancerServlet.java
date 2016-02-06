@@ -1,35 +1,39 @@
 package cz.nkd.cube;
 
 import org.apache.http.Header;
-import org.apache.http.HttpRequest;
-import org.apache.http.client.methods.CloseableHttpResponse;
-import org.apache.http.client.methods.HttpDelete;
-import org.apache.http.client.methods.HttpEntityEnclosingRequestBase;
-import org.apache.http.client.methods.HttpGet;
-import org.apache.http.client.methods.HttpHead;
-import org.apache.http.client.methods.HttpOptions;
-import org.apache.http.client.methods.HttpPost;
-import org.apache.http.client.methods.HttpPut;
-import org.apache.http.client.methods.HttpTrace;
-import org.apache.http.client.methods.HttpUriRequest;
+import org.apache.http.HttpEntity;
+import org.apache.http.HttpResponse;
+import org.apache.http.client.HttpClient;
+import org.apache.http.client.methods.*;
+import org.apache.http.client.protocol.HttpClientContext;
+import org.apache.http.client.utils.HttpClientUtils;
+import org.apache.http.config.Registry;
+import org.apache.http.config.RegistryBuilder;
+import org.apache.http.conn.socket.ConnectionSocketFactory;
+import org.apache.http.conn.socket.PlainConnectionSocketFactory;
+import org.apache.http.conn.ssl.NoopHostnameVerifier;
+import org.apache.http.conn.ssl.SSLConnectionSocketFactory;
+import org.apache.http.entity.ContentType;
 import org.apache.http.entity.InputStreamEntity;
-import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClientBuilder;
 import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
+import org.apache.http.util.EntityUtils;
+
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509TrustManager;
+import javax.servlet.*;
+import javax.servlet.http.HttpServletRequest;
+import javax.servlet.http.HttpServletResponse;
 
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
+import java.security.cert.CertificateException;
+import java.security.cert.X509Certificate;
 import java.util.Enumeration;
+import java.util.HashSet;
 import java.util.concurrent.atomic.AtomicInteger;
-
-import javax.servlet.Servlet;
-import javax.servlet.ServletConfig;
-import javax.servlet.ServletException;
-import javax.servlet.ServletRequest;
-import javax.servlet.ServletResponse;
-import javax.servlet.http.HttpServletRequest;
-import javax.servlet.http.HttpServletResponse;
 
 /**
  * @author Michal Nikodim (michal.nikodim@topmonks.com)
@@ -37,116 +41,182 @@ import javax.servlet.http.HttpServletResponse;
 public class SimpleLoadBalancerServlet implements Servlet {
 
     private ServletConfig config;
-    private String[] url;
-    private AtomicInteger index = new AtomicInteger(-1);
-    private CloseableHttpClient httpClient;
+    private String[] serverUri;
+    private AtomicInteger serverIndex = new AtomicInteger(-1);
+    private HttpClient httpClient;
+    protected HashSet<String> dontCopyHeaders = new HashSet<String>();
 
     public void init(ServletConfig config) throws ServletException {
         this.config = config;
-        String urls = config.getInitParameter("urls");
-        url = urls.split(",");
-
-        PoolingHttpClientConnectionManager manager = new PoolingHttpClientConnectionManager();
-        manager.setMaxTotal(10);
-        manager.setDefaultMaxPerRoute(10);
-        HttpClientBuilder builder = HttpClientBuilder.create();
-        builder.setConnectionManager(manager);
-        this.httpClient = builder.build();
-    }
-
-    public ServletConfig getServletConfig() {
-        return config;
+        initServers("http://localhost:8081/webapi,http://localhost:8082/webapi,http://localhost:8083/webapi,http://localhost:8084/webapi");
+        initHttpClient();
+        initDontCopyHeaders();
     }
 
     public void service(ServletRequest req, ServletResponse res) throws ServletException, IOException {
+        HttpServletRequest httpReq = (HttpServletRequest) req;
+        HttpServletResponse httpResp = (HttpServletResponse) res;
 
-        HttpServletRequest request = (HttpServletRequest) req;
-        HttpServletResponse response = (HttpServletResponse) res;
+        String destinationUrl = getDestinationUrl(httpReq);
 
-        HttpMethod method = HttpMethod.valueOf(request.getMethod());
+        HttpRequestBase request = createHttpRequest(httpReq.getMethod(), destinationUrl);
+        @SuppressWarnings("rawtypes")
+        Enumeration headerNames = httpReq.getHeaderNames();
+        while (headerNames.hasMoreElements()) {
+            String headerName = (String) headerNames.nextElement();
+            String headerValue = httpReq.getHeader(headerName);
+            if (!dontCopyHeaders.contains(headerName.toLowerCase())) {
+                request.addHeader(headerName, headerValue);
+            }
+        }
 
+        if (request instanceof HttpEntityEnclosingRequestBase && httpReq.getInputStream() != null) {
+            HttpEntityEnclosingRequestBase base = (HttpEntityEnclosingRequestBase) request;
+            HttpEntity entity = new InputStreamEntity(httpReq.getInputStream(), httpReq.getContentLength(), ContentType.create(httpReq.getContentType()));
+            base.setEntity(entity);
+        }
+
+        HttpResponse response = null;
+        try {
+            response = httpClient.execute(request, HttpClientContext.create());
+            httpResp.setStatus(response.getStatusLine().getStatusCode());
+            Header[] allHeaders = response.getAllHeaders();
+            for (Header header : allHeaders) {
+                httpResp.addHeader(header.getName(), header.getValue());
+            }
+            httpResp.setHeader("balancer", destinationUrl);
+            byte[] byteArray = EntityUtils.toByteArray(response.getEntity());
+            httpResp.getOutputStream().write(byteArray);
+            httpResp.flushBuffer();
+            //copyStream(response.getEntity(), httpResp.getOutputStream());
+        } finally {
+            HttpClientUtils.closeQuietly(response);
+        }
+    }
+
+    private HttpRequestBase createHttpRequest(String method, String completeUrl) {
+        if ("GET".equals(method)) {
+            return new HttpGet(completeUrl);
+        } else if ("POST".equals(method)) {
+            return new HttpPost(completeUrl);
+        } else if ("PUT".equals(method)) {
+            return new HttpPut(completeUrl);
+        } else if ("DELETE".equals(method)) {
+            return new HttpDelete(completeUrl);
+        } else if ("OPTIONS".equals(method)) {
+            return new HttpOptions(completeUrl);
+        } else if ("HEAD".equals(method)) {
+            return new HttpHead(completeUrl);
+        } else if ("TRACE".equals(method)) {
+            return new HttpTrace(completeUrl);
+        } else {
+            throw new RuntimeException("Unknown http method " + method);
+        }
+    }
+    
+    private void copyStream(HttpEntity entity, OutputStream output) throws IOException {
+        final InputStream instream = entity.getContent();
+        if (instream != null) {
+            try {
+                final byte[] tmp = new byte[4096];
+                int l;
+                while ((l = instream.read(tmp)) != -1) {
+                    output.write(tmp, 0, l);
+                }
+            } finally {
+                instream.close();
+                output.flush();
+            }
+        }
+    }
+
+    private String getDestinationUrl(HttpServletRequest request) {
         String incommingUrl = request.getPathInfo();
         String incommingQuery = request.getQueryString();
-        int i = index.incrementAndGet() % url.length;
-        String outgoingUrl = url[i] + ("/".equals(incommingUrl) ? "" : incommingUrl) + (incommingQuery != null ? "?" + incommingQuery : "");
-
-        System.out.println(outgoingUrl);
-
-        HttpUriRequest httpUriRequest = createMessage(method, outgoingUrl);
-        copyHeaders(request, httpUriRequest);
-
-        if (httpUriRequest instanceof HttpEntityEnclosingRequestBase) {
-            InputStreamEntity httpEntity = new InputStreamEntity(req.getInputStream());
-            httpEntity.setContentType(request.getContentType());
-            HttpEntityEnclosingRequestBase hur = (HttpEntityEnclosingRequestBase) httpUriRequest;
-            hur.setEntity(httpEntity);
+        int i = serverIndex.incrementAndGet() % serverUri.length;
+        StringBuilder sb = new StringBuilder(serverUri[i]);
+        if (!"/".equals(incommingUrl)) {
+            sb.append(incommingUrl);
         }
+        if (incommingQuery != null) {
+            sb.append("?").append(incommingQuery);
+        }
+        return sb.toString();
+    }
 
-        CloseableHttpResponse httpResponse = null;
+    private void initServers(String servers) {
+        serverUri = servers.split(",");
+        for (int i = 0; i < serverUri.length; i++) {
+            serverUri[i] = serverUri[i].trim();
+        }
+    }
+
+    private void initHttpClient() {
         try {
-            httpResponse = httpClient.execute(httpUriRequest);
-            response.setHeader("balancer", outgoingUrl);
-            Header[] allHeaders = httpResponse.getAllHeaders();
-            for (Header header : allHeaders) {
-                response.setHeader(header.getName(), header.getValue());
-            }
-            response.setContentLength((int) httpResponse.getEntity().getContentLength());
-            response.setContentType(httpResponse.getEntity().getContentType().getValue());
-            copyStream(httpResponse.getEntity().getContent(), response.getOutputStream());
-            response.setStatus(httpResponse.getStatusLine().getStatusCode());
-            response.flushBuffer();
-        } finally {
-            if (httpResponse != null) httpResponse.close();
-        }
+            SSLContext sslContext = SSLContext.getInstance("SSL");
+            sslContext.init(null, new TrustManager[] { new X509TrustManager() {
 
+                public X509Certificate[] getAcceptedIssuers() {
+                    return null;
+                }
+
+                public void checkServerTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+                    //trusted
+                }
+
+                public void checkClientTrusted(X509Certificate[] chain, String authType) throws CertificateException {
+                    //trusted
+                }
+            } }, null);
+            SSLConnectionSocketFactory sslSocketFactory = new SSLConnectionSocketFactory(sslContext, NoopHostnameVerifier.INSTANCE);
+
+            RegistryBuilder<ConnectionSocketFactory> registryBuilder = RegistryBuilder.<ConnectionSocketFactory> create();
+            registryBuilder.register("http", PlainConnectionSocketFactory.getSocketFactory());
+            registryBuilder.register("https", sslSocketFactory);
+            Registry<ConnectionSocketFactory> registry = registryBuilder.build();
+
+            PoolingHttpClientConnectionManager connectionManager = new PoolingHttpClientConnectionManager(registry);
+            connectionManager.setDefaultMaxPerRoute(50);
+            connectionManager.setMaxTotal(200);
+
+            HttpClientBuilder builder = HttpClientBuilder.create();
+            builder.setConnectionManager(connectionManager);
+            builder.disableAutomaticRetries();
+            builder.disableContentCompression();
+            builder.disableCookieManagement();
+            builder.disableRedirectHandling();
+            builder.disableContentCompression();
+
+            httpClient = builder.build();
+        } catch (Throwable e) {
+            throw new RuntimeException("HttpClient initialization failed", e);
+        }
     }
 
-    private static void copyStream(InputStream input, OutputStream output) throws IOException {
-        byte[] buffer = new byte[1024];
-        int bytesRead;
-        while ((bytesRead = input.read(buffer)) != -1) {
-            output.write(buffer, 0, bytesRead);
-        }
-    }
-
-    private HttpUriRequest createMessage(HttpMethod httpMethod, String url) {
-        switch (httpMethod) {
-            case GET:
-                return new HttpGet(url);
-            case POST:
-                return new HttpPost(url);
-            case PUT:
-                return new HttpPut(url);
-            case DELETE:
-                return new HttpDelete(url);
-            case OPTIONS:
-                return new HttpOptions(url);
-            case HEAD:
-                return new HttpHead(url);
-            case TRACE:
-                return new HttpTrace(url);
-        }
-        throw new RuntimeException("Unknown method " + httpMethod);
-    }
-
-    @SuppressWarnings("unchecked")
-    private void copyHeaders(HttpServletRequest request, HttpRequest httpRequest) {
-        Enumeration<String> headerNames = request.getHeaderNames();
-        while (headerNames.hasMoreElements()) {
-            String name = headerNames.nextElement();
-            if (!"content-length".equalsIgnoreCase(name)) {
-                String value = request.getHeader(name);
-                httpRequest.addHeader(name, value);
-            }
-        }
+    private void initDontCopyHeaders() {
+        //dontCopyHeaders.add("proxy-connection");
+        //dontCopyHeaders.add("connection");
+        //dontCopyHeaders.add("host");
+        dontCopyHeaders.add("content-length");
+        dontCopyHeaders.add("content-type");
+        //dontCopyHeaders.add("keep-alive");
+        //dontCopyHeaders.add("transfer-encoding");
+        //dontCopyHeaders.add("te");
+        //dontCopyHeaders.add("trailer");
+        //dontCopyHeaders.add("proxy-authorization");
+        //dontCopyHeaders.add("proxy-authenticate");
+        //dontCopyHeaders.add("upgrade");
     }
 
     public String getServletInfo() {
         return "simple-load-balancer";
     }
 
+    public ServletConfig getServletConfig() {
+        return config;
+    }
+
     public void destroy() {
         //nothing
     }
-
 }

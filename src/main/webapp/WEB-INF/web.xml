@@ -7,10 +7,6 @@
     <servlet>
         <servlet-name>simple-load-balancer</servlet-name>
         <servlet-class>cz.nkd.cube.SimpleLoadBalancerServlet</servlet-class>
-        <init-param>
-           <param-name>urls</param-name>
-           <param-value>http://localhost:8081/webapi,http://localhost:8083/webapi</param-value>
-        </init-param>
         <load-on-startup>1</load-on-startup>
     </servlet>
 
