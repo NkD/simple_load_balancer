@@ -17,7 +17,6 @@ import org.apache.http.entity.ContentType;
 import org.apache.http.entity.InputStreamEntity;
 import org.apache.http.impl.client.HttpClientBuilder;
 import org.apache.http.impl.conn.PoolingHttpClientConnectionManager;
-import org.apache.http.util.EntityUtils;
 
 import javax.net.ssl.SSLContext;
 import javax.net.ssl.TrustManager;
@@ -48,7 +47,7 @@ public class SimpleLoadBalancerServlet implements Servlet {
 
     public void init(ServletConfig config) throws ServletException {
         this.config = config;
-        initServers("http://localhost:8081/webapi,http://localhost:8082/webapi,http://localhost:8083/webapi,http://localhost:8084/webapi");
+        initServers("http://localhost:8081/webapi,http://localhost:8082/webapi");
         initHttpClient();
         initDontCopyHeaders();
     }
@@ -85,10 +84,7 @@ public class SimpleLoadBalancerServlet implements Servlet {
                 httpResp.addHeader(header.getName(), header.getValue());
             }
             httpResp.setHeader("balancer", destinationUrl);
-            byte[] byteArray = EntityUtils.toByteArray(response.getEntity());
-            httpResp.getOutputStream().write(byteArray);
-            httpResp.flushBuffer();
-            //copyStream(response.getEntity(), httpResp.getOutputStream());
+            copyStream(response.getEntity(), httpResp.getOutputStream());
         } finally {
             HttpClientUtils.closeQuietly(response);
         }
@@ -113,7 +109,7 @@ public class SimpleLoadBalancerServlet implements Servlet {
             throw new RuntimeException("Unknown http method " + method);
         }
     }
-    
+
     private void copyStream(HttpEntity entity, OutputStream output) throws IOException {
         final InputStream instream = entity.getContent();
         if (instream != null) {
@@ -194,11 +190,13 @@ public class SimpleLoadBalancerServlet implements Servlet {
     }
 
     private void initDontCopyHeaders() {
-        //dontCopyHeaders.add("proxy-connection");
-        //dontCopyHeaders.add("connection");
-        //dontCopyHeaders.add("host");
+        dontCopyHeaders.add("connection");
+        dontCopyHeaders.add("host");
         dontCopyHeaders.add("content-length");
         dontCopyHeaders.add("content-type");
+        dontCopyHeaders.add("user-agent");
+        dontCopyHeaders.add("accept-encoding");
+        //dontCopyHeaders.add("proxy-connection");
         //dontCopyHeaders.add("keep-alive");
         //dontCopyHeaders.add("transfer-encoding");
         //dontCopyHeaders.add("te");
