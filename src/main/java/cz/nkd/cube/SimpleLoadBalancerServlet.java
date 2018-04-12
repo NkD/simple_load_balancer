@@ -51,7 +51,9 @@ public class SimpleLoadBalancerServlet implements Servlet {
     
     public void init(ServletConfig config) throws ServletException {
         this.config = config;
-        initServers("http://localhost:8081/webapi,http://localhost:8082/webapi,http://localhost:8083/webapi,http://localhost:8084/webapi");
+        String defaultUrls = "http://localhost:8081/webapi,http://localhost:8082/webapi,http://localhost:8083/webapi,http://localhost:8084/webapi";
+        String urls = System.getProperty("urls", defaultUrls);
+        initServers(urls);
     }
 
     public void service(ServletRequest req, ServletResponse res) throws ServletException, IOException {
